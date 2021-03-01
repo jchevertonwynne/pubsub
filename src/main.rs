@@ -6,7 +6,6 @@ use std::{
     convert::TryInto,
     error::Error,
     hash::{Hash, Hasher},
-    sync::Arc,
 };
 
 use tokio::{
@@ -93,24 +92,25 @@ impl<const SHARDS: usize> PubSubShards<SHARDS> {
         PubSubShards { shards }
     }
 
-    async fn feed(&self, msg: MessageType) {
-        let topic: &str = match &msg {
-            MessageType::Pub(t, _, _) => t,
-            MessageType::Sub(t, _, _) => t,
-            MessageType::Unsub(t, _, _) => t,
-        };
-        let mut hasher = DefaultHasher::new();
-        topic.hash(&mut hasher);
-        let bucket = (hasher.finish() % SHARDS as u64) as usize;
-        if let Err(err) = self.shards[bucket].send(msg).await {
-            eprintln!("{}", err.to_string());
-        }
-    }
-}
+    fn run(self) -> Sender<MessageType> {
+        let (send, mut rec) = tokio::sync::mpsc::channel(10);
+        tokio::spawn(async move {
+            while let Some(msg) = rec.recv().await {
+                let topic: &str = match &msg {
+                    MessageType::Pub(t, _, _) => t,
+                    MessageType::Sub(t, _, _) => t,
+                    MessageType::Unsub(t, _, _) => t,
+                };
+                let mut hasher = DefaultHasher::new();
+                topic.hash(&mut hasher);
+                let bucket = (hasher.finish() % SHARDS as u64) as usize;
+                if let Err(err) = self.shards[bucket].send(msg).await {
+                    eprintln!("{}", err.to_string());
+                }
+            }
+        });
 
-impl<const SHARDS: usize> Drop for PubSubShards<SHARDS> {
-    fn drop(&mut self) {
-        todo!()
+        send
     }
 }
 
@@ -118,18 +118,19 @@ impl<const SHARDS: usize> Drop for PubSubShards<SHARDS> {
 async fn main() -> Result<(), Box<dyn Error>> {
     let listener = TcpListener::bind("127.0.0.1:8001").await?;
 
-    let shards: Arc<PubSubShards<100>> = Arc::new(PubSubShards::new());
+    let shards: PubSubShards<100> = PubSubShards::new();
+    let shards = shards.run();
 
     loop {
         let (conn, _) = listener.accept().await?;
-        let shards = Arc::clone(&shards);
+        let shards = shards.clone();
         handle_client_connection(conn, shards);
     }
 }
 
-fn handle_client_connection<const SHARDS: usize>(
+fn handle_client_connection(
     mut conn: tokio::net::TcpStream,
-    shards: Arc<PubSubShards<SHARDS>>,
+    shards: Sender<MessageType>,
 ) {
     tokio::spawn(async move {
         let (conn_read, conn_write) = conn.split();
@@ -172,10 +173,10 @@ async fn write_out(conn_write: WriteHalf<'_>, mut conn_to_ps_rec: Receiver<Strin
     }
 }
 
-async fn read_in<const SHARDS: usize>(
+async fn read_in(
     conn_read: ReadHalf<'_>,
     conn_to_ps_send: Sender<String>,
-    shards: Arc<PubSubShards<SHARDS>>,
+    shards: Sender<MessageType>,
 ) {
     let mut user_input = String::new();
     let mut reader = BufReader::new(conn_read);
@@ -203,7 +204,9 @@ async fn read_in<const SHARDS: usize>(
             "p" | "pub" | "publish" if parts.len() == 3 => {
                 let (notify_done, done) = oneshot::channel();
                 let action = MessageType::Pub(parts[1].clone(), parts[2].clone(), notify_done);
-                shards.feed(action).await;
+                if let Err(err) = shards.send(action).await {
+                    eprintln!("pub send error - {}", err.to_string())
+                }
                 if let Err(err) = done.await {
                     eprintln!("pub oneshot error - {}", err.to_string());
                 }
@@ -211,7 +214,9 @@ async fn read_in<const SHARDS: usize>(
             "s" | "sub" | "subscribe" if parts.len() == 2 => {
                 let (notify_done, done) = oneshot::channel();
                 let action = MessageType::Sub(parts[1].to_string(), conn_to_ps_send.clone(), notify_done);
-                shards.feed(action).await;
+                if let Err(err) = shards.send(action).await {
+                    eprintln!("sub send error - {}", err.to_string())
+                }
                 let ind = match done.await {
                     Ok(ind) => ind,
                     Err(err) => {
@@ -222,13 +227,15 @@ async fn read_in<const SHARDS: usize>(
                 positions.insert(parts[1].clone(), ind);
             }
             "u" | "unsub" | "unsubscribe" if parts.len() == 2 => {
-                let (notify_done, done) = oneshot::channel();
                 let ind = match positions.get(&parts[1]) {
                     Some(&ind) => ind,
                     None => continue
                 };
+                let (notify_done, done) = oneshot::channel();
                 let action = MessageType::Unsub(parts[1].clone(), ind, notify_done);
-                shards.feed(action).await;
+                if let Err(err) = shards.send(action).await {
+                    eprintln!("pub send error - {}", err.to_string())
+                }
                 if let Err(err) = done.await {
                     eprintln!("unsub oneshot error - {}", err.to_string());
                 }
@@ -245,7 +252,9 @@ async fn read_in<const SHARDS: usize>(
     for (topic, ind) in positions {
         let (os, or) = oneshot::channel();
         let action = MessageType::Unsub(topic, ind, os);
-        shards.feed(action).await;
+        if let Err(err) = shards.send(action).await {
+            eprintln!("pub send error - {}", err.to_string())
+        }
         if let Err(err) = or.await {
             eprintln!("unsub oneshot error - {}", err.to_string());
         }
